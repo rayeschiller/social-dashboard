@@ -13,8 +13,9 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "migrate": "tsx scripts/migrate.ts",
-    "sync": "NODE_USE_ENV_PROXY=1 tsx scripts/sync.ts",
-    "test": "NODE_USE_ENV_PROXY=1 vitest run"
+    "sync": "NODE_USE_ENV_PROXY=1 node --disable-warning=UNDICI-EHPA --import tsx scripts/sync.ts",
+    "test": "NODE_USE_ENV_PROXY=1 NODE_OPTIONS=\"$NODE_OPTIONS --disable-warning=UNDICI-EHPA\" vitest run",
+    "migrate:test": "tsx scripts/migrate.ts --test"
   },
   "dependencies": {
     "next": "^16.4.6",
