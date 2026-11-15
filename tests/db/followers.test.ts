@@ -151,7 +151,8 @@ describe("remainingTo100k and requiredDailyPace", () => {
 
   it("is 0 once the goal is reached, and unavailable after the deadline", async () => {
     await insertSnapshot(db, acct, "2026-11-15T16:00:00Z", 100_500);
-    expect((await remainingTo100k({ db, now, goal })).status === "available").toBe(true);
+    const rem = await remainingTo100k({ db, now, goal });
+    expect(rem).toMatchObject({ status: "available", value: 0 });
     const pace = await requiredDailyPace({ db, now, goal });
     expect(pace.status === "available" && pace.value.perDay).toBe(0);
     const late = await requiredDailyPace({ db, now: new Date("2027-01-02T12:00:00Z"), goal });
