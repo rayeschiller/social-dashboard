@@ -50,10 +50,6 @@ export type MediaFieldMetric = (typeof MEDIA_FIELD_METRICS)[number];
 
 const BY_NAME = new Map(MEDIA_INSIGHT_METRICS.map((m) => [m.name, m]));
 
-export function metricDefinition(name: string): MetricDefinition | undefined {
-  return BY_NAME.get(name);
-}
-
 export function isPlatformEstimated(name: string): boolean {
   return BY_NAME.get(name)?.platformEstimated ?? false;
 }

@@ -67,10 +67,6 @@ export function isAvailable<T>(p: Provenanced<T>): p is Available<T> {
   return p.status === "available";
 }
 
-export function isAvailabilityStatus(s: string): s is AvailabilityStatus {
-  return (AVAILABILITY_STATUSES as readonly string[]).includes(s);
-}
-
 const integerFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const decimalFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 

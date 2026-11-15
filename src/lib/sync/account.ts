@@ -19,7 +19,7 @@
 import type { Queryable } from "../db";
 import { withTransaction } from "../db";
 import { SOURCES, type AvailabilityStatus } from "../provenance";
-import { audit, nowFn, runJob, SyncAbort, type SyncContext, type SyncRunResult } from "./runs";
+import { nowFn, runJob, SyncAbort, type SyncContext, type SyncRunResult } from "./runs";
 
 export const ME_FIELDS = [
   "user_id",
@@ -196,13 +196,4 @@ export async function syncAccountInsights(ctx: SyncContext): Promise<SyncRunResu
       stats: { points: points.length, inserted, unchanged, apiRequests: client.requestCount },
     };
   });
-}
-
-export async function recordOAuthConnection(
-  db: Queryable,
-  igUserId: string,
-  username: string,
-  scopes: string[],
-): Promise<void> {
-  await audit(db, "oauth", "instagram_account_connected", { type: "ig_account", id: igUserId }, { username, scopes });
 }
