@@ -371,10 +371,10 @@ export function NewFollowers({ data, tz }: P) {
 function PostMetric({ m, tz, format, note }: { m: MediaMetric; tz: string; format?: (v: number) => string; note?: string }) {
   const last = lastRecordedText(m, tz, format);
   return (
-    <>
+    <span className="pm">
       <Metric p={m} tz={tz} format={format} note={note} />
       {last && <span className="small block last-recorded">{last}</span>}
-    </>
+    </span>
   );
 }
 
