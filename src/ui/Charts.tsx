@@ -24,7 +24,7 @@ export function FollowerChart({ days, tz }: { days: DailyFollowerPoint[]; tz: st
   const first = days[0]!.date;
   const last = days[days.length - 1]!.date;
   return (
-    <svg
+    <div className="chart-wrap"><svg
       className="chart"
       viewBox={`0 0 ${W} ${H}`}
       role="img"
@@ -54,7 +54,7 @@ export function FollowerChart({ days, tz }: { days: DailyFollowerPoint[]; tz: st
       )}
       <text className="tick" x={PAD.l} y={H - 8}>{formatLocalDateShort(first)}</text>
       <text className="tick" x={W - PAD.r} y={H - 8} textAnchor="end">{formatLocalDateShort(last)}</text>
-    </svg>
+    </svg></div>
   );
 }
 
@@ -80,7 +80,7 @@ export function NewFollowersChart({
   const barW = Math.max(3, Math.min(14, IW / 40));
   const fmt = formatInt;
   return (
-    <svg
+    <div className="chart-wrap"><svg
       className="chart"
       viewBox={`0 0 ${W} ${H}`}
       role="img"
@@ -110,6 +110,6 @@ export function NewFollowersChart({
       <text className="tick" x={PAD.l - 8} y={PAD.t + IH + 4} textAnchor="end">0</text>
       <text className="tick" x={PAD.l} y={H - 8}>{formatDateTime(from, tz).split(",").slice(0, 2).join(",")}</text>
       <text className="tick" x={W - PAD.r} y={H - 8} textAnchor="end">{formatDateTime(to, tz).split(",").slice(0, 2).join(",")}</text>
-    </svg>
+    </svg></div>
   );
 }
