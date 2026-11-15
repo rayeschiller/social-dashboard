@@ -2,7 +2,7 @@ import Link from "next/link";
 import { isAvailable, formatSigned } from "../lib/provenance";
 import type { DashboardData } from "../lib/queries/ui/dashboard";
 import { HISTORY_DAYS } from "../lib/queries/ui/dashboard";
-import type { GrowthPeriod, MediaMetric } from "../lib/queries";
+import { FOLLOWER_SNAPSHOT_STALE_HOURS, type GrowthPeriod, type MediaMetric } from "../lib/queries";
 import { averageDailyNet, paceGap, progressPct } from "./derive";
 import { FollowerChart, NewFollowersChart } from "./Charts";
 import {
@@ -130,7 +130,7 @@ export function Hero({ data, tz }: P) {
           </span>
           {current.stale && (
             <span className="pill pill-warn chip" role="status">
-              Stale: last sync is over 8 hours old
+              Stale: snapshot is over {FOLLOWER_SNAPSHOT_STALE_HOURS} hours old
             </span>
           )}
         </p>
