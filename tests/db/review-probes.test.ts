@@ -1,6 +1,7 @@
 /**
- * Adversarial review probes. Each test asserts the CORRECT behaviour per the product rules;
- * a failing test here is evidence of a defect. All numbers are SYNTHETIC fixtures.
+ * Adversarial review probes (from the independent review of the follower-tracking path), now part
+ * of the permanent suite. Each test asserts the CORRECT behaviour per the product rules; a
+ * failure is a regression of a reviewed defect. All numbers are SYNTHETIC fixtures.
  */
 import { randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -11,6 +12,7 @@ import { planMediaInsights } from "../../src/lib/instagram/metrics";
 import {
   currentFollowers,
   daysRemaining,
+  followerHistory,
   mediaWithLatestMetrics,
   netGrowth,
   newFollowersDaily,
@@ -47,20 +49,38 @@ const meFor = (id: string, username: string, followers: unknown = 5000): Route =
 // Rule 1: account followers only from the API followers_count field
 // ---------------------------------------------------------------------------------------------
 describe("R1 follower source", () => {
+  // Original probe inserted a manual-source row and expected currentFollowers to ignore it. Fix #2
+  // adds a CHECK so such a row can no longer exist at all, which made the original INSERT throw.
+  // The probe is therefore split into (a) the schema rejects the row, and (b) the query layer
+  // still ignores it and reports the real source when the CHECK is absent (dropped inside a
+  // rolled-back transaction). Both halves are at least as strict as the original assertion.
   it("currentFollowers must ignore a non-API (manual) snapshot and never label it instagram_graph_api", async () => {
     const acct = await insertAccount(db);
     await insertSnapshot(db, acct, "2026-11-15T10:00:00Z", 5000);
     const runId = await insertRun(db, "account", new Date("2026-11-15T12:00:00Z"));
-    // Schema accepts this: source FK allows the manual source, no entered_by requirement on account_snapshots.
-    await db.query(
-      `INSERT INTO account_snapshots (ig_user_id, followers_count, followers_count_status, follows_count_status,
-         media_count_status, source, retrieved_at, sync_run_id)
-       VALUES ($1, 66000, 'available', 'unavailable', 'unavailable', 'instagram_app_insights_manual', $2, $3)`,
-      [acct, new Date("2026-11-15T12:00:00Z"), runId],
-    );
-    const r = await currentFollowers({ db, now });
-    // Expected: 5000 from the API snapshot. Actual: 66000 labelled source=instagram_graph_api.
-    expect(r).toMatchObject({ status: "available", value: 5000, source: "instagram_graph_api" });
+    const insertManual = (q: Pick<typeof db, "query">) =>
+      q.query(
+        `INSERT INTO account_snapshots (ig_user_id, followers_count, followers_count_status, follows_count_status,
+           media_count_status, source, retrieved_at, sync_run_id, created_at)
+         VALUES ($1, 66000, 'available', 'unavailable', 'unavailable', 'instagram_app_insights_manual', $2, $3, $2)`,
+        [acct, new Date("2026-11-15T12:00:00Z"), runId],
+      );
+    // (a) the schema refuses it
+    await expect(insertManual(db)).rejects.toThrow(/account_snapshots_source_api_only/);
+    // (b) defence in depth: the queries filter on source even without the CHECK
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("ALTER TABLE account_snapshots DROP CONSTRAINT account_snapshots_source_api_only");
+      await insertManual(client);
+      const r = await currentFollowers({ db: client, now });
+      expect(r).toMatchObject({ status: "available", value: 5000, source: "instagram_graph_api" });
+      const hist = await followerHistory({ db: client, now, from: new Date("2026-11-15T00:00:00Z") });
+      expect(hist.map((h) => h.followers)).toEqual([expect.objectContaining({ value: 5000, source: "instagram_graph_api" })]);
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
   });
 });
 
@@ -309,7 +329,7 @@ describe("R4/R5 time edges (verification)", () => {
   });
 
   it("GOAL_DEADLINE with an impossible date must be rejected", () => {
-    expect(() => getGoalConfig({ GOAL_DEADLINE: "2026-02-31" } as NodeJS.ProcessEnv)).toThrow();
+    expect(() => getGoalConfig({ GOAL_DEADLINE: "2026-02-31" } as unknown as NodeJS.ProcessEnv)).toThrow();
   });
 });
 

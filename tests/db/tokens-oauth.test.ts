@@ -63,15 +63,37 @@ describe("refreshTokenJob", () => {
     await storeToken(db, { igUserId: acct, accessToken: "SYNTHETIC-due", scopes: [], issuedAt, expiresInSeconds: 60 * 86_400, obtainedVia: "oauth_callback" });
     const f = fakeFetch([
       (u) => (u.pathname === "/refresh_access_token" ? { body: { access_token: "SYNTHETIC-refreshed", token_type: "bearer", expires_in: 5_184_000 } } : undefined),
+      (u) => (u.pathname.endsWith("/me") ? { body: { user_id: acct, id: "app-1", username: "synthetic_user" } } : undefined),
     ]);
     const run = await refreshTokenJob({ db, client: dbClient(), trigger: "test" }, { fetchImpl: f.fetch });
     expect(run.status).toBe("succeeded");
-    expect(f.calls[0]!.authorization).toBe("Bearer SYNTHETIC-due");
-    expect(f.calls[0]!.url.searchParams.get("grant_type")).toBe("ig_refresh_token");
-    expect(f.calls[0]!.url.searchParams.has("access_token")).toBe(false);
+    // /me with the stored token (account check), refresh, /me with the new token (account check)
+    expect(f.calls.map((c) => [c.url.pathname.replace(/^\/v[\d.]+/, ""), c.authorization])).toEqual([
+      ["/me", "Bearer SYNTHETIC-due"],
+      ["/refresh_access_token", "Bearer SYNTHETIC-due"],
+      ["/me", "Bearer SYNTHETIC-refreshed"],
+    ]);
+    const refreshCall = f.calls[1]!;
+    expect(refreshCall.url.searchParams.get("grant_type")).toBe("ig_refresh_token");
+    expect(refreshCall.url.searchParams.has("access_token")).toBe(false);
     expect((await getActiveToken(db))?.accessToken).toBe("SYNTHETIC-refreshed");
     const { rows } = await db.query("SELECT stats::text AS s, error_message FROM sync_runs WHERE id = $1", [run.id]);
     expect(rows[0].s).not.toContain("SYNTHETIC");
+  });
+
+  it("refuses to refresh (and stores nothing) when the stored token belongs to another account", async () => {
+    const acct = await insertAccount(db);
+    await storeToken(db, { igUserId: acct, accessToken: "SYNTHETIC-due", scopes: [], issuedAt: new Date(Date.now() - 40 * 86_400_000), expiresInSeconds: 60 * 86_400, obtainedVia: "oauth_callback" });
+    const f = fakeFetch([
+      (u) => (u.pathname === "/refresh_access_token" ? { body: { access_token: "SYNTHETIC-refreshed", expires_in: 5_184_000 } } : undefined),
+      (u) => (u.pathname.endsWith("/me") ? { body: { user_id: "17840000000000999", username: "someone_else" } } : undefined),
+    ]);
+    const run = await refreshTokenJob({ db, client: dbClient(), trigger: "test" }, { fetchImpl: f.fetch });
+    expect(run).toMatchObject({ status: "failed", errorCode: "unexpected_account" });
+    expect(f.calls.some((c) => c.url.pathname === "/refresh_access_token")).toBe(false);
+    expect((await db.query("SELECT count(*)::int AS n FROM oauth_tokens")).rows[0].n).toBe(1);
+    const audit = await db.query("SELECT action FROM audit_log");
+    expect(audit.rows.map((r) => r.action)).toContain("tracked_account_mismatch_rejected");
   });
 
   it("skips a token that is not due", async () => {

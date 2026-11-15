@@ -1,5 +1,6 @@
 import type pg from "pg";
-import { getInstagramConfig } from "../config";
+import { ensurePinnedFromEnv } from "../account/tracked";
+import { getInstagramConfig, requireExpectedUsername } from "../config";
 import { clientFor, resolveAuth } from "../instagram/auth";
 import type { InstagramClient } from "../instagram/client";
 import { syncAccount, syncAccountInsights } from "./account";
@@ -16,14 +17,25 @@ export type SyncJob = "account" | "media" | "token" | "all";
 
 export const SYNC_JOBS: readonly SyncJob[] = ["account", "media", "token", "all"];
 
-/** Builds a context from env/DB credentials. A missing credential becomes `clientError`. */
+/**
+ * Builds a context from env/DB credentials. A missing credential becomes `clientError`.
+ * Fails closed: without IG_EXPECTED_USERNAME, or when IG_EXPECTED_USER_ID contradicts the pinned
+ * account, every job records a failed run (code config_error / unexpected_account) and stores
+ * nothing.
+ */
 export async function createSyncContext(
   db: pg.Pool,
   trigger: SyncTrigger,
   overrides: { client?: InstagramClient; now?: () => Date } = {},
 ): Promise<SyncContext> {
   const cfg = getInstagramConfig();
-  const base = { db, trigger, now: overrides.now, expectedUsername: cfg.expectedUsername };
+  const base = { db, trigger, now: overrides.now, expectedUsername: cfg.expectedUsername, expectedUserId: cfg.expectedUserId };
+  try {
+    requireExpectedUsername(cfg);
+    await ensurePinnedFromEnv(db, cfg);
+  } catch (err) {
+    return { ...base, client: null, clientError: err as Error };
+  }
   if (overrides.client) return { ...base, client: overrides.client };
   try {
     const auth = await resolveAuth(db, cfg);

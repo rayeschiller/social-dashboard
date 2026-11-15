@@ -16,8 +16,18 @@
  *   fewer than 100 followers"). If Meta rejects the metric the run fails with the API's error and
  *   nothing is stored. https://developers.facebook.com/docs/instagram-platform/api-reference/instagram-user/insights/
  */
+import {
+  AccountMismatchError,
+  assertTrackable,
+  auditRefusal,
+  getPinnedAccountId,
+  meAccountId,
+  pinOrVerify,
+  verifyClientAccount,
+} from "../account/tracked";
 import type { Queryable } from "../db";
 import { withTransaction } from "../db";
+import { validateMetricValue } from "../instagram/metrics";
 import { SOURCES, type AvailabilityStatus } from "../provenance";
 import { nowFn, runJob, SyncAbort, type SyncContext, type SyncRunResult } from "./runs";
 
@@ -45,6 +55,9 @@ export function readCount(raw: unknown, field: string): CountReading {
   if (typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0) {
     return { value: raw, status: "available" };
   }
+  if (typeof raw === "number") {
+    return { value: null, status: "error", reason: `${field} was ${raw}, not a non-negative whole number within the safe integer range` };
+  }
   return { value: null, status: "error", reason: `${field} had an unexpected value type (${typeof raw})` };
 }
 
@@ -53,56 +66,64 @@ export async function syncAccount(ctx: SyncContext): Promise<SyncRunResult> {
   return runJob(ctx, "account", async (runId, client) => {
     const me = await client.getMe(ME_FIELDS);
     const retrievedAt = now();
-    const igUserId = me.user_id ?? me.id;
-    if (!igUserId || typeof igUserId !== "string") {
+    const igUserId = meAccountId(me);
+    if (!igUserId) {
       throw new SyncAbort("invalid_response", "GET /me returned neither user_id nor id");
     }
     if (!me.username) throw new SyncAbort("invalid_response", "GET /me returned no username");
-    if (ctx.expectedUsername && me.username.toLowerCase() !== ctx.expectedUsername.toLowerCase()) {
-      throw new SyncAbort(
-        "unexpected_account",
-        `token belongs to @${me.username}, expected @${ctx.expectedUsername}; nothing was stored`,
-      );
-    }
+    const who = { igUserId, username: me.username };
+    const expect = { expectedUsername: ctx.expectedUsername, expectedUserId: ctx.expectedUserId };
 
     const followers = readCount(me.followers_count, "followers_count");
     const follows = readCount(me.follows_count, "follows_count");
     const mediaCount = readCount(me.media_count, "media_count");
     const reasons = [followers, follows, mediaCount].map((r) => r.reason).filter(Boolean);
 
-    await withTransaction(ctx.db, async (tx) => {
-      await upsertAccount(tx, {
-        igUserId,
-        appScopedId: me.id ?? null,
-        username: me.username!,
-        accountType: me.account_type ?? null,
-      });
-      await tx.query(
-        `INSERT INTO account_snapshots
-           (ig_user_id, followers_count, followers_count_status, follows_count, follows_count_status,
-            media_count, media_count_status, source, retrieved_at, sync_run_id, status_reason)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         ON CONFLICT (ig_user_id, sync_run_id) DO NOTHING`,
-        [
+    let pinnedNow = false;
+    try {
+      // Refuse before opening the write transaction, then re-check under it (pin race).
+      await assertTrackable(ctx.db, who, expect);
+      await withTransaction(ctx.db, async (tx) => {
+        pinnedNow = await pinOrVerify(tx, who, "account_sync", expect);
+        await upsertAccount(tx, {
           igUserId,
-          followers.value,
-          followers.status,
-          follows.value,
-          follows.status,
-          mediaCount.value,
-          mediaCount.status,
-          SOURCES.instagramGraphApi,
-          retrievedAt,
-          runId,
-          reasons.length ? reasons.join("; ") : null,
-        ],
-      );
-    });
+          appScopedId: me.id ?? null,
+          username: me.username!,
+          accountType: me.account_type ?? null,
+        });
+        await tx.query(
+          `INSERT INTO account_snapshots
+             (ig_user_id, followers_count, followers_count_status, follows_count, follows_count_status,
+              media_count, media_count_status, source, retrieved_at, sync_run_id, status_reason)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           ON CONFLICT (ig_user_id, sync_run_id) DO NOTHING`,
+          [
+            igUserId,
+            followers.value,
+            followers.status,
+            follows.value,
+            follows.status,
+            mediaCount.value,
+            mediaCount.status,
+            SOURCES.instagramGraphApi,
+            retrievedAt,
+            runId,
+            reasons.length ? reasons.join("; ") : null,
+          ],
+        );
+      });
+    } catch (err) {
+      if (err instanceof AccountMismatchError) {
+        await auditRefusal(ctx.db, "system", err, { syncRunId: runId });
+        throw new SyncAbort(err.code, err.message, { pinnedIgUserId: err.pinnedIgUserId });
+      }
+      throw err;
+    }
 
     return {
       igUserId,
       status: followers.status === "available" ? "succeeded" : "partial",
-      stats: { followersCountStatus: followers.status, apiRequests: client.requestCount },
+      stats: { followersCountStatus: followers.status, apiRequests: client.requestCount, pinnedNow },
       note:
         followers.status === "available"
           ? undefined
@@ -127,12 +148,9 @@ export async function upsertAccount(
   );
 }
 
-/** The account the dashboard tracks: the most recently updated row in ig_accounts. */
+/** The account the dashboard tracks: the pinned id in tracked_account (null until pinned). */
 export async function getTrackedAccountId(db: Queryable): Promise<string | null> {
-  const { rows } = await db.query<{ ig_user_id: string }>(
-    "SELECT ig_user_id FROM ig_accounts ORDER BY updated_at DESC LIMIT 1",
-  );
-  return rows[0]?.ig_user_id ?? null;
+  return getPinnedAccountId(db);
 }
 
 export const FOLLOWER_COUNT_INSIGHT = { metric: "follower_count", period: "day" } as const;
@@ -141,10 +159,7 @@ const INSIGHT_LOOKBACK_DAYS = 30;
 export async function syncAccountInsights(ctx: SyncContext): Promise<SyncRunResult> {
   const now = nowFn(ctx);
   return runJob(ctx, "account_insights", async (runId, client) => {
-    const igUserId = await getTrackedAccountId(ctx.db);
-    if (!igUserId) {
-      throw new SyncAbort("no_account", "No Instagram account is known yet; the account sync must succeed first");
-    }
+    const igUserId = await verifyClientAccount(ctx.db, client);
     const until = now();
     const since = new Date(until.getTime() - INSIGHT_LOOKBACK_DAYS * 86_400_000);
     const { metric, period } = FOLLOWER_COUNT_INSIGHT;
@@ -165,12 +180,15 @@ export async function syncAccountInsights(ctx: SyncContext): Promise<SyncRunResu
 
     let inserted = 0;
     let unchanged = 0;
+    let invalid = 0;
     await withTransaction(ctx.db, async (tx) => {
       for (const p of points) {
-        const status: AvailabilityStatus =
-          p.value.kind === "value" ? "available" : p.value.kind === "absent" ? "unavailable" : "error";
-        const value = p.value.kind === "value" ? p.value.value : null;
-        const reason = p.value.kind === "value" ? null : p.value.reason;
+        // follower_count is a count: anything but a non-negative safe integer is an 'error'.
+        const v = validateMetricValue(metric, p.value);
+        const status: AvailabilityStatus = v.kind === "value" ? "available" : v.kind === "absent" ? "unavailable" : "error";
+        if (v.kind === "invalid") invalid++;
+        const value = v.kind === "value" ? v.value : null;
+        const reason = v.kind === "value" ? null : v.reason;
         const res = await tx.query(
           `INSERT INTO account_insight_observations
              (ig_user_id, metric, period, end_time, value, status, is_platform_estimated, source,
@@ -193,7 +211,9 @@ export async function syncAccountInsights(ctx: SyncContext): Promise<SyncRunResu
     });
     return {
       igUserId,
-      stats: { points: points.length, inserted, unchanged, apiRequests: client.requestCount },
+      status: invalid > 0 ? "partial" : "succeeded",
+      stats: { points: points.length, inserted, unchanged, invalid, apiRequests: client.requestCount },
+      note: invalid > 0 ? { code: "invalid_values", message: `${invalid} ${metric} value(s) were not valid counts and were stored as 'error'` } : undefined,
     };
   });
 }

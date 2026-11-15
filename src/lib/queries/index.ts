@@ -8,14 +8,21 @@ export {
   currentFollowers,
   daysRemaining,
   DEFAULT_TOLERANCE_HOURS,
+  FOLLOWER_SNAPSHOT_STALE_HOURS,
   followerHistory,
   followerHistoryDaily,
   netGrowth,
+  netGrowthForLocalDay,
   newFollowersDaily,
+  previousLocalDate,
   remainingTo100k,
   requiredDailyPace,
+  snapshotAge,
   windowStart,
+  type CurrentFollowers,
   type DailyFollowerPoint,
+  type LocalDayNetGrowth,
+  type SnapshotAge,
   type GrowthPeriod,
   type NetGrowth,
   type NewFollowersPoint,
@@ -24,7 +31,8 @@ export {
   type SnapshotHistoryPoint,
   type SnapshotPoint,
 } from "./followers";
-export { mediaWithLatestMetrics, type MediaWithMetrics } from "./media";
+export { mediaWithLatestMetrics, type LastAvailable, type MediaMetric, type MediaWithMetrics } from "./media";
+export { getPinnedAccount, getPinnedAccountId, type PinnedAccount } from "../account/tracked";
 export {
   lastSuccessfulSync,
   recentErrors,

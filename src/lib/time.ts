@@ -75,7 +75,26 @@ export function startOfLocalDay(d: LocalDate, tz: string): Date {
   // Two passes converge for every real-world offset, including DST change days.
   let guess = wall - tzOffsetMs(new Date(wall), tz);
   guess = wall - tzOffsetMs(new Date(guess), tz);
-  return new Date(guess);
+  const l = localDateTime(new Date(guess), tz);
+  if (l.year === d.year && l.month === d.month && l.day === d.day && l.hour === 0 && l.minute === 0 && l.second === 0) {
+    return new Date(guess);
+  }
+  // Local midnight does not exist on this day (a DST gap at 00:00, e.g. America/Santiago in
+  // September): the day starts at the first instant whose local date is `d`. Binary search for
+  // it; the local date is non-decreasing across a forward gap.
+  const target = Date.UTC(d.year, d.month - 1, d.day);
+  const dayKey = (t: number) => {
+    const x = localDate(new Date(t), tz);
+    return Date.UTC(x.year, x.month - 1, x.day);
+  };
+  let lo = wall - 36 * 3600_000; // local date < d
+  let hi = wall + 36 * 3600_000; // local date > d
+  while (hi - lo > 1000) {
+    const mid = lo + Math.floor((hi - lo) / 2000) * 1000;
+    if (dayKey(mid) < target) lo = mid;
+    else hi = mid;
+  }
+  return new Date(hi);
 }
 
 /** Add whole calendar days to a local date. */

@@ -17,8 +17,13 @@
  *   No baseline in the tolerance band, or no snapshot after the window start -> 'unavailable'
  *   with a reason. The delta therefore covers [baseline.retrievedAt, end.retrievedAt], which can
  *   start up to `tolerance` before the window; the UI must show both timestamps.
+ *
+ * SOURCE: every query here reads only rows with source = 'instagram_graph_api' (the schema also
+ * enforces that since migration 0002) and reports the row's own source.
+ * ACCOUNT: the pinned tracked account (tracked_account) unless `igUserId` is passed explicitly.
  */
-import { getGoalConfig, type GoalConfig } from "../config";
+import { getPinnedAccountId } from "../account/tracked";
+import { getGoalConfig, isRealCalendarDate, type GoalConfig } from "../config";
 import type { Queryable } from "../db";
 import {
   available,
@@ -36,7 +41,7 @@ export const DEFAULT_TOLERANCE_HOURS: Record<GrowthPeriod, number> = { day: 6, w
 
 export interface QueryOptions {
   db: Queryable;
-  /** Defaults to the most recently updated account in ig_accounts. */
+  /** Defaults to the pinned tracked account (tracked_account); unavailable when nothing is pinned. */
   igUserId?: string;
   now?: Date;
   goal?: GoalConfig;
@@ -47,6 +52,8 @@ export interface SnapshotPoint {
   followers: number;
   retrievedAt: Date;
   syncRunId: number;
+  /** The row's own source (always 'instagram_graph_api'; optional only for type compatibility). */
+  source?: string;
 }
 
 interface SnapshotRow {
@@ -54,41 +61,78 @@ interface SnapshotRow {
   followers_count: number;
   retrieved_at: Date;
   sync_run_id: number;
+  source: string;
 }
 
+const SNAPSHOT_COLUMNS = "id, followers_count, retrieved_at, sync_run_id, source";
+/** Only the Instagram API's followers_count is a follower count. */
+const API_ONLY = `source = '${SOURCES.instagramGraphApi}'`;
+
 function toPoint(r: SnapshotRow): SnapshotPoint {
-  return { snapshotId: r.id, followers: r.followers_count, retrievedAt: r.retrieved_at, syncRunId: r.sync_run_id };
+  return { snapshotId: r.id, followers: r.followers_count, retrievedAt: r.retrieved_at, syncRunId: r.sync_run_id, source: r.source };
 }
 
 async function resolveAccount(o: QueryOptions): Promise<string | null> {
   if (o.igUserId) return o.igUserId;
-  const { rows } = await o.db.query<{ ig_user_id: string }>(
-    "SELECT ig_user_id FROM ig_accounts ORDER BY updated_at DESC LIMIT 1",
-  );
-  return rows[0]?.ig_user_id ?? null;
+  return getPinnedAccountId(o.db);
 }
 
-const NO_ACCOUNT = "No Instagram account has been synced yet";
+const NO_ACCOUNT = "No Instagram account is tracked yet (the first account sync or OAuth connect pins it)";
 
-async function latestSnapshot(db: Queryable, igUserId: string, atOrBefore: Date): Promise<SnapshotPoint | null> {
+async function latestSnapshot(
+  db: Queryable,
+  igUserId: string,
+  atOrBefore: Date,
+  notBefore: Date | null = null,
+): Promise<SnapshotPoint | null> {
   const { rows } = await db.query<SnapshotRow>(
-    `SELECT id, followers_count, retrieved_at, sync_run_id
+    `SELECT ${SNAPSHOT_COLUMNS}
        FROM account_snapshots
-      WHERE ig_user_id = $1 AND followers_count_status = 'available' AND retrieved_at <= $2
+      WHERE ig_user_id = $1 AND followers_count_status = 'available' AND ${API_ONLY}
+        AND retrieved_at <= $2 AND ($3::timestamptz IS NULL OR retrieved_at >= $3)
       ORDER BY retrieved_at DESC, id DESC
       LIMIT 1`,
-    [igUserId, atOrBefore],
+    [igUserId, atOrBefore, notBefore],
   );
   return rows[0] ? toPoint(rows[0]) : null;
 }
 
+/** A follower snapshot older than this is flagged `stale` (the account sync runs every 4 hours). */
+export const FOLLOWER_SNAPSHOT_STALE_HOURS = 8;
+
+export interface SnapshotAge {
+  /** Hours between the snapshot's retrieved_at and `now` (fractional, never negative). */
+  ageHours: number;
+  /** True when ageHours > staleAfterHours. */
+  stale: boolean;
+  staleAfterHours: number;
+}
+
+/** Age / staleness of an observation retrieved at `retrievedAt`, as of `now`. */
+export function snapshotAge(retrievedAt: Date, now: Date = new Date(), staleAfterHours = FOLLOWER_SNAPSHOT_STALE_HOURS): SnapshotAge {
+  const ageHours = Math.max(0, (now.getTime() - retrievedAt.getTime()) / 3600_000);
+  return { ageHours, stale: ageHours > staleAfterHours, staleAfterHours };
+}
+
+/**
+ * currentFollowers' result: a Provenanced<number>; when available it also carries the snapshot's
+ * age so the UI can show "as of N hours ago" and flag a stale figure.
+ */
+export type CurrentFollowers = Provenanced<number> & { snapshotAgeHours?: number; stale?: boolean };
+
 /** Latest stored followers_count. Source: IG User `followers_count` only. */
-export async function currentFollowers(o: QueryOptions): Promise<Provenanced<number>> {
+export async function currentFollowers(o: QueryOptions & { staleAfterHours?: number }): Promise<CurrentFollowers> {
   const igUserId = await resolveAccount(o);
   if (!igUserId) return notAvailable("unavailable", NO_ACCOUNT);
-  const snap = await latestSnapshot(o.db, igUserId, o.now ?? new Date());
+  const now = o.now ?? new Date();
+  const snap = await latestSnapshot(o.db, igUserId, now);
   if (!snap) return notAvailable("unavailable", "No followers_count snapshot has been recorded yet");
-  return available(snap.followers, SOURCES.instagramGraphApi, snap.retrievedAt, { syncRunId: snap.syncRunId });
+  const age = snapshotAge(snap.retrievedAt, now, o.staleAfterHours);
+  return {
+    ...available(snap.followers, snap.source ?? SOURCES.instagramGraphApi, snap.retrievedAt, { syncRunId: snap.syncRunId }),
+    snapshotAgeHours: age.ageHours,
+    stale: age.stale,
+  };
 }
 
 export function windowStart(period: GrowthPeriod, now: Date, timezone: string): Date {
@@ -127,25 +171,17 @@ export async function netGrowth(
 
   const ws = windowStart(period, now, tz);
   const earliest = new Date(ws.getTime() - toleranceHours * 3600_000);
-  const { rows: baseRows } = await o.db.query<SnapshotRow>(
-    `SELECT id, followers_count, retrieved_at, sync_run_id
-       FROM account_snapshots
-      WHERE ig_user_id = $1 AND followers_count_status = 'available'
-        AND retrieved_at <= $2 AND retrieved_at >= $3
-      ORDER BY retrieved_at DESC, id DESC
-      LIMIT 1`,
-    [igUserId, ws, earliest],
-  );
-  if (!baseRows[0]) {
+  const baseline = await latestSnapshot(o.db, igUserId, ws, earliest);
+  if (!baseline) {
     return notAvailable(
       "unavailable",
       `No followers_count snapshot between ${earliest.toISOString()} and the ${period} start ${ws.toISOString()} (${tz}); net change needs an actual snapshot at the start of the window`,
     );
   }
   const { rows: endRows } = await o.db.query<SnapshotRow>(
-    `SELECT id, followers_count, retrieved_at, sync_run_id
+    `SELECT ${SNAPSHOT_COLUMNS}
        FROM account_snapshots
-      WHERE ig_user_id = $1 AND followers_count_status = 'available'
+      WHERE ig_user_id = $1 AND followers_count_status = 'available' AND ${API_ONLY}
         AND retrieved_at > $2 AND retrieved_at <= $3
       ORDER BY retrieved_at DESC, id DESC
       LIMIT 1`,
@@ -154,10 +190,90 @@ export async function netGrowth(
   if (!endRows[0]) {
     return notAvailable("unavailable", `No followers_count snapshot since the ${period} start ${ws.toISOString()} (${tz})`);
   }
-  const start = toPoint(baseRows[0]);
+  const start = baseline;
   const end = toPoint(endRows[0]);
   return available<NetGrowth>(
     { delta: end.followers - start.followers, start, end, period, windowStart: ws, timezone: tz, toleranceHours },
+    SOURCES.derived,
+    end.retrievedAt,
+  );
+}
+
+export interface LocalDayNetGrowth {
+  /** The local calendar day, YYYY-MM-DD in `timezone`. */
+  date: string;
+  /** end.followers - start.followers (can be negative). */
+  delta: number;
+  /** Latest API snapshot at or before the day's start (no earlier than start - tolerance). */
+  start: SnapshotPoint;
+  /** Latest API snapshot at or before the day's end (no earlier than end - tolerance). */
+  end: SnapshotPoint;
+  /** Local 00:00 of `date` (or the first instant of the day if midnight was skipped). */
+  dayStart: Date;
+  /** Local 00:00 of the next day. */
+  dayEnd: Date;
+  /** 24, or 23 / 25 on DST change days. */
+  dayLengthHours: number;
+  timezone: string;
+  toleranceHours: number;
+}
+
+/** The local calendar date before `now`'s local date ("yesterday"), YYYY-MM-DD. */
+export function previousLocalDate(now: Date, timezone: string): string {
+  return formatLocalDate(addDays(localDate(now, timezone), -1));
+}
+
+/**
+ * Net follower change over one COMPLETED local calendar day (e.g. yesterday), between the latest
+ * API snapshot at-or-before the day's start and the latest API snapshot at-or-before the day's
+ * end, each within `toleranceHours` (default 6) of its boundary. Unavailable if the day has not
+ * ended yet or either snapshot is missing; nothing is interpolated.
+ */
+export async function netGrowthForLocalDay(
+  date: string,
+  o: QueryOptions & { toleranceHours?: number },
+): Promise<Provenanced<LocalDayNetGrowth>> {
+  const now = o.now ?? new Date();
+  const goal = o.goal ?? getGoalConfig();
+  const tz = goal.timezone;
+  const toleranceHours = o.toleranceHours ?? DEFAULT_TOLERANCE_HOURS.day;
+  if (!isRealCalendarDate(date)) return notAvailable("error", `Not a calendar date: ${date}`);
+  const igUserId = await resolveAccount(o);
+  if (!igUserId) return notAvailable("unavailable", NO_ACCOUNT);
+
+  const d = parseLocalDate(date);
+  const dayStart = startOfLocalDay(d, tz);
+  const dayEnd = startOfLocalDay(addDays(d, 1), tz);
+  if (dayEnd.getTime() > now.getTime()) {
+    return notAvailable("unavailable", `${date} (${tz}) has not ended yet; net change is only reported for completed days`);
+  }
+  const tolMs = toleranceHours * 3600_000;
+  const start = await latestSnapshot(o.db, igUserId, dayStart, new Date(dayStart.getTime() - tolMs));
+  if (!start) {
+    return notAvailable(
+      "unavailable",
+      `No followers_count snapshot within ${toleranceHours}h before the start of ${date} (${dayStart.toISOString()}, ${tz})`,
+    );
+  }
+  const end = await latestSnapshot(o.db, igUserId, dayEnd, new Date(dayEnd.getTime() - tolMs));
+  if (!end || end.snapshotId === start.snapshotId) {
+    return notAvailable(
+      "unavailable",
+      `No followers_count snapshot within ${toleranceHours}h before the end of ${date} (${dayEnd.toISOString()}, ${tz})`,
+    );
+  }
+  return available<LocalDayNetGrowth>(
+    {
+      date,
+      delta: end.followers - start.followers,
+      start,
+      end,
+      dayStart,
+      dayEnd,
+      dayLengthHours: (dayEnd.getTime() - dayStart.getTime()) / 3600_000,
+      timezone: tz,
+      toleranceHours,
+    },
     SOURCES.derived,
     end.retrievedAt,
   );
@@ -255,7 +371,7 @@ export async function followerHistory(
   }>(
     `SELECT id, followers_count, followers_count_status, retrieved_at, sync_run_id, source, status_reason
        FROM account_snapshots
-      WHERE ig_user_id = $1 AND retrieved_at >= $2 AND retrieved_at <= $3
+      WHERE ig_user_id = $1 AND ${API_ONLY} AND retrieved_at >= $2 AND retrieved_at <= $3
       ORDER BY retrieved_at ASC, id ASC`,
     [igUserId, o.from, o.to ?? o.now ?? new Date()],
   );
@@ -329,7 +445,7 @@ export async function newFollowersDaily(o: QueryOptions & { from?: Date; to?: Da
   }>(
     `SELECT DISTINCT ON (end_time) end_time, value, status, source, retrieved_at, sync_run_id, status_reason
        FROM account_insight_observations
-      WHERE ig_user_id = $1 AND metric = 'follower_count' AND period = 'day'
+      WHERE ig_user_id = $1 AND metric = 'follower_count' AND period = 'day' AND ${API_ONLY}
         AND ($2::timestamptz IS NULL OR end_time >= $2)
         AND ($3::timestamptz IS NULL OR end_time <= $3)
       ORDER BY end_time ASC, retrieved_at DESC, id DESC`,

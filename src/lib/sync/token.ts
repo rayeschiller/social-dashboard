@@ -10,6 +10,7 @@
 import { withTransaction } from "../db";
 import { getInstagramConfig } from "../config";
 import { InstagramClient } from "../instagram/client";
+import { getPinnedAccountId, verifyClientAccount } from "../account/tracked";
 import { getActiveToken, storeToken } from "../tokens/store";
 import { audit, nowFn, runJob, SyncAbort, type SyncContext, type SyncRunResult } from "./runs";
 
@@ -36,7 +37,9 @@ export async function refreshTokenJob(
           },
         };
       }
-      const token = await getActiveToken(ctx.db);
+      const pinned = await getPinnedAccountId(ctx.db);
+      if (!pinned) throw new SyncAbort("no_account", "No tracked Instagram account is pinned yet");
+      const token = await getActiveToken(ctx.db, pinned);
       if (!token) throw new SyncAbort("no_token", "no stored token to refresh");
       const t = now();
       const age = t.getTime() - token.issuedAt.getTime();
@@ -63,7 +66,19 @@ export async function refreshTokenJob(
         baseUrl: cfg.graphBaseUrl,
         fetchImpl: opts.fetchImpl,
       });
+      // The stored token must still belong to the tracked account, and so must the refreshed one.
+      await verifyClientAccount(ctx.db, refresher);
       const refreshed = await refresher.refreshLongLivedToken();
+      await verifyClientAccount(
+        ctx.db,
+        new InstagramClient({
+          accessToken: refreshed.accessToken,
+          authMode: "db",
+          apiVersion: cfg.apiVersion,
+          baseUrl: cfg.graphBaseUrl,
+          fetchImpl: opts.fetchImpl,
+        }),
+      );
       const issuedAt = now();
       const newId = await withTransaction(ctx.db, async (tx) => {
         const id = await storeToken(tx, {

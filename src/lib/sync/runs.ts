@@ -16,9 +16,18 @@ export interface SyncContext {
   clientError?: Error;
   trigger: SyncTrigger;
   now?: () => Date;
-  /** Username the connected account must have (IG_EXPECTED_USERNAME); unset = no check. */
+  /**
+   * Username the account must have to be pinned on the first account sync (IG_EXPECTED_USERNAME).
+   * The entry points (createSyncContext) refuse to run without it; once an account is pinned only
+   * its stable id is compared, whatever is set here.
+   */
   expectedUsername?: string;
+  /** Stable id the account must have to be pinned (IG_EXPECTED_USER_ID). */
+  expectedUserId?: string;
 }
+
+/** A run still 'running' after this long is dead (crashed / killed); the next run of its kind marks it failed. */
+export const STALE_RUN_TIMEOUT_MINUTES = 30;
 
 export interface JobOutcome {
   status?: Exclude<SyncRunStatus, "failed">;
@@ -128,6 +137,12 @@ export async function runJob(
       });
     }
 
+    await failStaleRuns(db, kind, runId);
+
+    const configError = ctx.clientError && (ctx.clientError as { code?: unknown }).code;
+    if (configError === "config_error" || configError === "unexpected_account") {
+      return await finishRun(db, runId, kind, "failed", {}, { code: configError, message: redact(ctx.clientError!.message) });
+    }
     if (!ctx.client && opts.requiresClient !== false) {
       const e = ctx.clientError ?? new NoTokenError();
       return await finishRun(db, runId, kind, "failed", {}, { code: "no_token", message: redact(e.message) });
@@ -175,6 +190,27 @@ export async function runJob(
     }
     lockClient.release();
   }
+}
+
+/**
+ * Marks runs of `kind` that have been 'running' for longer than the timeout as failed ("timed
+ * out"). Called while holding the per-kind lock, so no live run of this kind can be affected.
+ */
+export async function failStaleRuns(
+  db: Queryable,
+  kind: SyncKind,
+  excludeRunId: number,
+  timeoutMinutes = STALE_RUN_TIMEOUT_MINUTES,
+): Promise<number> {
+  const res = await db.query(
+    `UPDATE sync_runs
+        SET status = 'failed', finished_at = now(), error_code = 'timed_out', error_message = 'timed out',
+            error_detail = jsonb_build_object('timeoutMinutes', $3::int, 'markedByRunId', $2::bigint)
+      WHERE kind = $1 AND status = 'running' AND id <> $2
+        AND started_at < now() - make_interval(mins => $3::int)`,
+    [kind, excludeRunId, timeoutMinutes],
+  );
+  return res.rowCount ?? 0;
 }
 
 async function finishRun(

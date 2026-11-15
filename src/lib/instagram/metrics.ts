@@ -16,6 +16,8 @@
  *   - Story metrics are only available for 24 hours; values < 5 return error code 10.
  */
 
+import type { InsightValue } from "./client";
+
 export type MediaProductType = "FEED" | "REELS" | "STORY" | "AD";
 
 export interface MetricDefinition {
@@ -50,6 +52,54 @@ export type MediaFieldMetric = (typeof MEDIA_FIELD_METRICS)[number];
 
 const BY_NAME = new Map(MEDIA_INSIGHT_METRICS.map((m) => [m.name, m]));
 
+/** Upper bound for any stored metric value (matches the DB CHECK in migration 0002). */
+export const MAX_METRIC_VALUE = 1e15;
+
+/** Unit of a metric. Unknown metrics (and every account-level insight) are treated as counts. */
+export function metricUnit(name: string): MetricDefinition["unit"] {
+  return BY_NAME.get(name)?.unit ?? "count";
+}
+
+/**
+ * Checks a numeric API value against the metric's unit. Counts must be non-negative safe
+ * integers; durations and percentages may be fractional but must be finite, non-negative and
+ * bounded (percent <= 100). Anything else becomes `invalid`, which the sync stores as status
+ * 'error' with NULL and the reason.
+ */
+export function validateMetricValue(metric: string, v: InsightValue): InsightValue {
+  if (v.kind !== "value") return v;
+  const x = v.value;
+  const unit = metricUnit(metric);
+  const bad = (why: string): InsightValue => ({ kind: "invalid", reason: `API returned ${x} for ${metric}: ${why}` });
+  if (!Number.isFinite(x)) return bad("not a finite number");
+  if (x < 0) return bad("negative");
+  if (x > MAX_METRIC_VALUE) return bad(`above the plausible maximum ${MAX_METRIC_VALUE}`);
+  if (unit === "count" && !Number.isSafeInteger(x)) return bad("a count must be a whole number");
+  if (unit === "percent" && x > 100) return bad("a percentage above 100");
+  return v;
+}
+
+/**
+ * Metrics Meta documents for FEED/STORY but NOT for REELS. When the product type is unknown the
+ * item could be a Reel, so these are never requested (an API answer could not be trusted as a
+ * per-post value for a Reel); they are stored as 'unavailable' instead.
+ */
+const NOT_FOR_REELS = MEDIA_INSIGHT_METRICS.filter((m) => !m.productTypes.includes("REELS")).map((m) => m.name);
+export const PRODUCT_TYPE_UNKNOWN_REASON = "product type unknown";
+
+const REEL_PERMALINK = /instagram\.com\/(?:[A-Za-z0-9._]+\/)?(?:reel|reels)\//;
+
+/**
+ * The product type used to decide which metrics exist: the API's media_product_type, or REELS
+ * when the API omitted it but the permalink is a /reel/ URL (Instagram serves Reels, and only
+ * Reels, under /reel/). This is only ever used to request FEWER metrics, never more.
+ */
+export function effectiveProductType(apiProductType: string | null | undefined, permalink?: string | null): string | null {
+  if (apiProductType) return apiProductType;
+  if (permalink && REEL_PERMALINK.test(permalink)) return "REELS";
+  return null;
+}
+
 export function isPlatformEstimated(name: string): boolean {
   return BY_NAME.get(name)?.platformEstimated ?? false;
 }
@@ -65,7 +115,12 @@ export interface MetricPlan {
   request: string[];
   /** Metrics known from Meta's docs not to exist for this product type (stored as 'unsupported'). */
   unsupported: Array<{ metric: string; reason: string }>;
-  /** True when the product type was unknown, so the batch is the union and Meta decides. */
+  /**
+   * Metrics deliberately not requested because the product type is unknown and they do not exist
+   * for Reels (follows, profile_visits, profile_activity). Stored as 'unavailable'.
+   */
+  withheld: Array<{ metric: string; reason: string }>;
+  /** True when the product type was unknown: the rest of the catalogue is requested and Meta decides. */
   productTypeUnknown: boolean;
 }
 
@@ -73,14 +128,17 @@ export interface MetricPlan {
  * Which metrics to request for a media item. For a known product type we request only the
  * documented set (one unsupported metric can fail a whole insights request) and record the rest
  * of the catalogue as 'unsupported'. If media_product_type was not returned we cannot know, so we
- * request every metric individually and let the API's answer decide each status.
+ * request the remaining metrics individually and let the API's answer decide each status, except
+ * the FEED/STORY-only metrics (follows, profile_visits, profile_activity), which are never
+ * requested for an item that could be a Reel (see `withheld`).
  */
 export function planMediaInsights(productType: string | null | undefined): MetricPlan {
   const pt = normaliseProductType(productType);
   if (!pt || pt === "AD") {
     return {
-      request: MEDIA_INSIGHT_METRICS.map((m) => m.name),
+      request: MEDIA_INSIGHT_METRICS.map((m) => m.name).filter((n) => !NOT_FOR_REELS.includes(n)),
       unsupported: [],
+      withheld: NOT_FOR_REELS.map((metric) => ({ metric, reason: PRODUCT_TYPE_UNKNOWN_REASON })),
       productTypeUnknown: true,
     };
   }
@@ -91,7 +149,7 @@ export function planMediaInsights(productType: string | null | undefined): Metri
     if (reason) unsupported.push({ metric: m.name, reason });
     else request.push(m.name);
   }
-  return { request, unsupported, productTypeUnknown: false };
+  return { request, unsupported, withheld: [], productTypeUnknown: false };
 }
 
 /** Every metric the query layer reports for a media item (insights + node fields). */

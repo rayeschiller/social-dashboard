@@ -18,7 +18,7 @@ export interface ResolvedAuth {
 /**
  * Picks the credential for API calls, per IG_AUTH_MODE:
  *   env   -> IG_ACCESS_TOKEN
- *   db    -> newest active encrypted token from the OAuth flow
+ *   db    -> newest active encrypted token of the TRACKED (pinned) account from the OAuth flow
  *   proxy -> placeholder; the outbound proxy injects the real Authorization header
  *   auto  -> env if IG_ACCESS_TOKEN is set, else db if a token is stored, else NoTokenError
  */

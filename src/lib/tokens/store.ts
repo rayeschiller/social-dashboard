@@ -1,3 +1,4 @@
+import { getPinnedAccountId } from "../account/tracked";
 import type { Queryable } from "../db";
 import { decryptToken, encryptToken, parseEncryptionKey } from "./crypto";
 
@@ -71,21 +72,26 @@ interface TokenRow {
   scopes: string[];
 }
 
-/** Newest non-superseded, non-revoked token (optionally for one account), decrypted. */
+/**
+ * Newest non-superseded, non-revoked token of the TRACKED account, decrypted. `igUserId` defaults
+ * to the pinned tracked account id (tracked_account); with nothing pinned there is no token.
+ * Tokens of any other account are never returned implicitly.
+ */
 export async function getActiveToken(
   db: Queryable,
-  igUserId?: string,
+  igUserId?: string | null,
   key?: Buffer,
 ): Promise<StoredToken | null> {
+  const trackedId = igUserId ?? (await getPinnedAccountId(db));
+  if (!trackedId) return null;
   const { rows } = await db.query<TokenRow>(
     `SELECT id, ig_user_id, key_version, token_iv, token_ciphertext, token_auth_tag,
             issued_at, expires_at, scopes
        FROM oauth_tokens
-      WHERE superseded_at IS NULL AND revoked_at IS NULL
-        AND ($1::text IS NULL OR ig_user_id = $1)
+      WHERE superseded_at IS NULL AND revoked_at IS NULL AND ig_user_id = $1
       ORDER BY issued_at DESC, id DESC
       LIMIT 1`,
-    [igUserId ?? null],
+    [trackedId],
   );
   const row = rows[0];
   if (!row) return null;

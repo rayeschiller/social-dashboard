@@ -1,5 +1,6 @@
 import type pg from "pg";
-import { IG_OAUTH_SCOPES, type InstagramConfig } from "../config";
+import { AccountMismatchError, assertTrackable, ensurePinnedFromEnv, meAccountId, pinOrVerify } from "../account/tracked";
+import { ConfigError, IG_OAUTH_SCOPES, requireExpectedUsername, type InstagramConfig } from "../config";
 import { withTransaction } from "../db";
 import { audit } from "../sync/runs";
 import { upsertAccount } from "../sync/account";
@@ -19,8 +20,10 @@ export class OAuthCallbackError extends Error {
 
 /**
  * Completes the OAuth callback: verifies state, exchanges code -> short-lived -> long-lived token,
- * identifies the account with GET /me, refuses any account other than IG_EXPECTED_USERNAME, and
- * stores the long-lived token encrypted. Returns no token material.
+ * identifies the account with GET /me and stores the long-lived token encrypted. Fails closed:
+ * without IG_EXPECTED_USERNAME nothing happens at all. The first connect pins the account's
+ * stable id (if its username matches); afterwards any token whose id differs from the pinned id
+ * is refused, audited, and not stored. Returns no token material.
  */
 export async function completeOAuthCallback(
   db: pg.Pool,
@@ -28,8 +31,21 @@ export async function completeOAuthCallback(
   params: { code: string | null; state: string | null; error: string | null; errorReason: string | null; cookieState: string | undefined },
   fetchImpl?: typeof fetch,
 ): Promise<{ igUserId: string; username: string }> {
+  let expectedUsername: string;
+  try {
+    expectedUsername = requireExpectedUsername(cfg);
+  } catch (err) {
+    if (err instanceof ConfigError) throw new OAuthCallbackError("config_error", err.message);
+    throw err;
+  }
   if (!statesMatch(params.cookieState, params.state)) {
     throw new OAuthCallbackError("invalid_state", "OAuth state did not match; start again from /api/auth/instagram/start");
+  }
+  try {
+    await ensurePinnedFromEnv(db, cfg);
+  } catch (err) {
+    if (err instanceof AccountMismatchError) throw new OAuthCallbackError("config_error", err.message);
+    throw err;
   }
   if (params.error) {
     throw new OAuthCallbackError("denied", `Authorization was not granted (${params.errorReason ?? params.error})`);
@@ -47,25 +63,38 @@ export async function completeOAuthCallback(
     baseUrl: cfg.graphBaseUrl,
     fetchImpl,
   }).getMe(["user_id", "id", "username", "account_type"]);
-  const igUserId = me.user_id ?? me.id;
+  const igUserId = meAccountId(me);
   if (!igUserId || !me.username) throw new OAuthCallbackError("invalid_response", "GET /me did not identify the account");
-  if (cfg.expectedUsername && me.username.toLowerCase() !== cfg.expectedUsername.toLowerCase()) {
-    await audit(db, "oauth", "instagram_connect_rejected", { type: "ig_account", id: igUserId }, { username: me.username });
-    throw new OAuthCallbackError("unexpected_account", `@${me.username} is not the account this dashboard tracks`);
-  }
+  const who = { igUserId, username: me.username };
+  const expect = { expectedUsername, expectedUserId: cfg.expectedUserId };
 
   const scopes = short.permissions.length ? short.permissions : [...IG_OAUTH_SCOPES];
-  await withTransaction(db, async (tx) => {
-    await upsertAccount(tx, { igUserId, appScopedId: me.id ?? null, username: me.username!, accountType: me.account_type ?? null });
-    const tokenId = await storeToken(tx, {
-      igUserId,
-      accessToken: long.accessToken,
-      scopes,
-      issuedAt,
-      expiresInSeconds: long.expiresIn,
-      obtainedVia: "oauth_callback",
+  try {
+    await assertTrackable(db, who, expect);
+    await withTransaction(db, async (tx) => {
+      await upsertAccount(tx, { igUserId, appScopedId: me.id ?? null, username: me.username!, accountType: me.account_type ?? null });
+      const tokenId = await storeToken(tx, {
+        igUserId,
+        accessToken: long.accessToken,
+        scopes,
+        issuedAt,
+        expiresInSeconds: long.expiresIn,
+        obtainedVia: "oauth_callback",
+      });
+      await audit(tx, "oauth", "instagram_account_connected", { type: "ig_account", id: igUserId }, { username: me.username, scopes, tokenId });
+      // Pins on the first connect; re-checks the pin (rolls everything back on a mismatch).
+      await pinOrVerify(tx, who, "oauth_connect", expect);
     });
-    await audit(tx, "oauth", "instagram_account_connected", { type: "ig_account", id: igUserId }, { username: me.username, scopes, tokenId });
-  });
+  } catch (err) {
+    if (err instanceof AccountMismatchError) {
+      await audit(db, "oauth", "instagram_connect_rejected", { type: "ig_account", id: igUserId }, {
+        username: me.username,
+        pinnedIgUserId: err.pinnedIgUserId,
+        reason: err.message,
+      });
+      throw new OAuthCallbackError("unexpected_account", `@${me.username} is not the account this dashboard tracks; nothing was stored`);
+    }
+    throw err;
+  }
   return { igUserId, username: me.username };
 }

@@ -16,11 +16,18 @@ import type pg from "pg";
 import { withTransaction } from "../db";
 import type { IgMediaNode, InsightValue, InstagramClient } from "../instagram/client";
 import { InstagramApiError, statusForClassification } from "../instagram/errors";
-import { isPlatformEstimated, MEDIA_FIELD_METRICS, planMediaInsights } from "../instagram/metrics";
+import { verifyClientAccount } from "../account/tracked";
+import {
+  effectiveProductType,
+  isPlatformEstimated,
+  MAX_METRIC_VALUE,
+  MEDIA_FIELD_METRICS,
+  planMediaInsights,
+  validateMetricValue,
+} from "../instagram/metrics";
 import { SOURCES, type AvailabilityStatus } from "../provenance";
 import { redact } from "../redact";
-import { getTrackedAccountId } from "./account";
-import { nowFn, recordApiError, runJob, SyncAbort, type SyncContext, type SyncRunResult } from "./runs";
+import { nowFn, recordApiError, runJob, type SyncContext, type SyncRunResult } from "./runs";
 
 /** Field sets tried in order; later sets drop fields Meta documents as Facebook-Login-only. */
 export const MEDIA_FIELD_SETS: readonly (readonly string[])[] = [
@@ -109,8 +116,11 @@ function fieldObservation(m: IgMediaNode, field: (typeof MEDIA_FIELD_METRICS)[nu
   if (!requested) {
     return { igMediaId: m.id, metric: field, origin: "field", value: null, status: "unavailable", reason: `${field} was not requested (field set fallback)`, retrievedAt: at };
   }
-  if (typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0) {
+  if (typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 && raw <= MAX_METRIC_VALUE) {
     return { igMediaId: m.id, metric: field, origin: "field", value: raw, status: "available", reason: null, retrievedAt: at };
+  }
+  if (typeof raw === "number") {
+    return { igMediaId: m.id, metric: field, origin: "field", value: null, status: "error", reason: `${field} was ${raw}, not a non-negative whole number`, retrievedAt: at };
   }
   if (raw === undefined || raw === null) {
     return {
@@ -174,8 +184,7 @@ async function upsertMedia(tx: pg.PoolClient, igUserId: string, m: IgMediaNode, 
 export async function syncMedia(ctx: SyncContext, opts: { pageSize?: number } = {}): Promise<SyncRunResult> {
   const now = nowFn(ctx);
   return runJob(ctx, "media", async (runId, client) => {
-    const igUserId = await getTrackedAccountId(ctx.db);
-    if (!igUserId) throw new SyncAbort("no_account", "No Instagram account is known yet; the account sync must succeed first");
+    const igUserId = await verifyClientAccount(ctx.db, client);
 
     const stats = { pages: 0, mediaSeen: 0, mediaInserted: 0, observations: 0, fieldSet: 0, apiRequests: 0 };
     let fieldSetIndex = 0;
@@ -232,12 +241,14 @@ export interface MediaInsightsOptions {
 interface MediaRow {
   ig_media_id: string;
   media_product_type: string | null;
+  permalink?: string | null;
 }
 
 /** Classifications where isolating metrics one by one can help. */
 const ISOLATE_ON = new Set(["unsupported_metric", "invalid_request", "insufficient_data", "unknown"]);
 
-function fromInsight(mediaId: string, metric: string, v: InsightValue, at: Date): Observation {
+function fromInsight(mediaId: string, metric: string, raw: InsightValue, at: Date): Observation {
+  const v = validateMetricValue(metric, raw);
   if (v.kind === "value") {
     return { igMediaId: mediaId, metric, origin: "insight", value: v.value, status: "available", reason: null, retrievedAt: at };
   }
@@ -275,16 +286,27 @@ export async function fetchMediaInsightObservations(
   media: MediaRow,
   now: () => Date,
 ): Promise<Observation[]> {
-  const plan = planMediaInsights(media.media_product_type);
-  const obs: Observation[] = plan.unsupported.map((u) => ({
-    igMediaId: media.ig_media_id,
-    metric: u.metric,
-    origin: "insight" as const,
-    value: null,
-    status: "unsupported" as const,
-    reason: u.reason,
-    retrievedAt: now(),
-  }));
+  const plan = planMediaInsights(effectiveProductType(media.media_product_type, media.permalink));
+  const obs: Observation[] = [
+    ...plan.unsupported.map((u) => ({
+      igMediaId: media.ig_media_id,
+      metric: u.metric,
+      origin: "insight" as const,
+      value: null,
+      status: "unsupported" as const,
+      reason: media.media_product_type ? u.reason : `${u.reason} (product type taken from the /reel/ permalink)`,
+      retrievedAt: now(),
+    })),
+    ...plan.withheld.map((u) => ({
+      igMediaId: media.ig_media_id,
+      metric: u.metric,
+      origin: "insight" as const,
+      value: null,
+      status: "unavailable" as const,
+      reason: u.reason,
+      retrievedAt: now(),
+    })),
+  ];
   if (plan.request.length === 0) return obs;
 
   // Unknown product type: the union would certainly fail as a batch, go straight to per-metric.
@@ -322,11 +344,10 @@ export async function syncMediaInsights(ctx: SyncContext, opts: MediaInsightsOpt
   const now = nowFn(ctx);
   const minIntervalHours = opts.minIntervalHours ?? 6;
   return runJob(ctx, "media_insights", async (runId, client) => {
-    const igUserId = await getTrackedAccountId(ctx.db);
-    if (!igUserId) throw new SyncAbort("no_account", "No Instagram account is known yet; the account sync must succeed first");
+    const igUserId = await verifyClientAccount(ctx.db, client);
 
     const { rows: media } = await ctx.db.query<MediaRow>(
-      `SELECT m.ig_media_id, m.media_product_type
+      `SELECT m.ig_media_id, m.media_product_type, m.permalink
          FROM media m
         WHERE m.ig_user_id = $1
           AND ($2::text[] IS NULL OR m.ig_media_id = ANY($2))
