@@ -1,7 +1,8 @@
 /**
- * Read-only account/connection lookup for the dashboard header. Only reads ig_accounts and
+ * Read-only lookup of the pinned tracked account and its connection state for the dashboard header. Only reads ig_accounts and
  * oauth_tokens metadata (never token material).
  */
+import { getPinnedAccount } from "../../account/tracked";
 import type { Queryable } from "../../db";
 import { available, notAvailable, SOURCES, type Provenanced } from "../../provenance";
 
@@ -16,14 +17,23 @@ export interface AccountInfo {
 }
 
 export async function getAccountInfo(db: Queryable, now: Date = new Date()): Promise<Provenanced<AccountInfo>> {
+  const pinned = await getPinnedAccount(db);
+  if (!pinned) return notAvailable("unavailable", "No tracked Instagram account is pinned yet; connect or sync the account first");
   const { rows } = await db.query<{
-    ig_user_id: string;
     username: string;
     account_type: string | null;
     updated_at: Date;
-  }>("SELECT ig_user_id, username, account_type, updated_at FROM ig_accounts ORDER BY updated_at DESC LIMIT 1");
-  const a = rows[0];
-  if (!a) return notAvailable("unavailable", "No Instagram account has been connected or synced yet");
+  }>("SELECT username, account_type, updated_at FROM ig_accounts WHERE ig_user_id = $1", [pinned.igUserId]);
+  const row = rows[0];
+  if (!row && !pinned.usernameAtPin) {
+    return notAvailable("unavailable", "The tracked account has no stored profile row yet");
+  }
+  const a = {
+    ig_user_id: pinned.igUserId,
+    username: row?.username ?? pinned.usernameAtPin ?? pinned.igUserId,
+    account_type: row?.account_type ?? null,
+    updated_at: row?.updated_at ?? pinned.pinnedAt,
+  };
 
   const { rows: tokens } = await db.query<{ expires_at: Date | null }>(
     `SELECT expires_at FROM oauth_tokens

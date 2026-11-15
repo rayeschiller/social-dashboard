@@ -3,7 +3,7 @@ import { available, formatMetric, notAvailable, type Provenanced } from "../../s
 import type { MediaWithMetrics } from "../../src/lib/queries/media";
 import { averageDailyNet, followConversionPct, followsPer1000Views } from "../../src/ui/derive";
 import { runs } from "../../src/ui/chart";
-import { formatDurationMs, provenanceText } from "../../src/ui/format";
+import { formatAgeHours, formatDurationMs, lastRecordedText, localizeIsoTimestamps, provenanceText } from "../../src/ui/format";
 import { buildPostView, nextSort, parseSort, sortPosts, type PostView } from "../../src/ui/posts";
 
 const T = new Date("2026-11-10T12:00:00Z");
@@ -131,5 +131,49 @@ describe("chart gaps and pace", () => {
     );
     expect(averageDailyNet(net)).toMatchObject({ status: "available", value: 5 });
     expect(formatMetric(averageDailyNet(na()))).toBe("Unavailable");
+  });
+});
+
+describe("ISO timestamps inside reasons", () => {
+  it("rewrites zoned timestamps into the reporting timezone", () => {
+    const out = localizeIsoTimestamps("No snapshot before the start of 2026-11-14 (2026-11-14T05:00:00.000Z, America/New_York)", "America/New_York");
+    expect(out).toContain("Nov 14, 2026, 12:00 AM");
+    expect(out).not.toContain("T05:00");
+    expect(out).toContain("2026-11-14 (");
+  });
+  it("rewrites every timestamp and leaves zone-less or invalid ones alone", () => {
+    expect(localizeIsoTimestamps("a 2026-11-14T05:00:00Z b 2026-11-15T17:30:00+00:00", "UTC")).toBe("a Nov 14, 2026, 5:00 AM UTC b Nov 15, 2026, 5:30 PM UTC");
+    expect(localizeIsoTimestamps("at 2026-11-14T05:00:00 local", "UTC")).toBe("at 2026-11-14T05:00:00 local");
+    expect(localizeIsoTimestamps("bad 2026-13-45T99:00:00Z", "UTC")).toBe("bad 2026-13-45T99:00:00Z");
+    expect(localizeIsoTimestamps("no timestamps here", "UTC")).toBe("no timestamps here");
+  });
+  it("keeps the original in provenance text", () => {
+    const t = provenanceText(na("missing before 2026-11-14T05:00:00.000Z"), "America/New_York");
+    expect(t).toContain("12:00 AM");
+    expect(t).toContain("(original: missing before 2026-11-14T05:00:00.000Z)");
+  });
+});
+
+describe("snapshot age and last recorded lines", () => {
+  it("formats whole hours", () => {
+    expect(formatAgeHours(0.2)).toBe("0 hours ago");
+    expect(formatAgeHours(1)).toBe("1 hour ago");
+    expect(formatAgeHours(9.6)).toBe("10 hours ago");
+  });
+  const last = { value: 12, source: "instagram_graph_api" as const, retrievedAt: new Date("2026-11-03T15:00:00Z"), syncRunId: 1 };
+  it("shows a last-recorded line only for non-available metrics that have one", () => {
+    expect(lastRecordedText({ ...na(), lastAvailable: last }, "UTC")).toBe("last recorded 12 on Nov 3, 2026");
+    expect(lastRecordedText({ ...na(), lastAvailable: { ...last, value: 0 } }, "UTC")).toBe("last recorded 0 on Nov 3, 2026");
+    expect(lastRecordedText(na(), "UTC")).toBeNull();
+    expect(lastRecordedText({ ...av(5), lastAvailable: last }, "UTC")).toBeNull();
+  });
+  it("never lets lastAvailable affect rendering, sorting or ratios", () => {
+    const withLast = { ...na(), lastAvailable: last };
+    const a = buildPostView(media("a", { views: withLast, follows: av(5) }));
+    const b = buildPostView(media("b", { views: av(1) }));
+    expect(formatMetric(a.views)).toBe("Unavailable");
+    expect(formatMetric(a.followsPer1k)).toBe("Unavailable");
+    expect(ids(sortPosts([a, b], { key: "views", dir: "desc" }))).toEqual(["b", "a"]);
+    expect(ids(sortPosts([a, b], { key: "views", dir: "asc" }))).toEqual(["b", "a"]);
   });
 });

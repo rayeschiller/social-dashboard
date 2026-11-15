@@ -1,6 +1,9 @@
-/** Post table view-model and server-side sorting. Unavailable values always sort last. */
+/**
+ * Post table view-model and server-side sorting. Unavailable values always sort last.
+ * Sorting and derived ratios read only the latest observation; `lastAvailable` is display-only.
+ */
 import { isAvailable, notAvailable, type Provenanced } from "../lib/provenance";
-import type { MediaWithMetrics } from "../lib/queries/media";
+import type { MediaMetric, MediaWithMetrics } from "../lib/queries/media";
 import { followConversionPct, followsPer1000Views } from "./derive";
 
 export const SORT_KEYS = [
@@ -48,23 +51,23 @@ export interface PostView {
   media: MediaWithMetrics;
   isReel: boolean;
   publishedMs: number | null;
-  views: Provenanced<number>;
-  reach: Provenanced<number>;
-  likes: Provenanced<number>;
-  comments: Provenanced<number>;
-  shares: Provenanced<number>;
-  saves: Provenanced<number>;
-  avgWatch: Provenanced<number>;
-  totalWatch: Provenanced<number>;
-  follows: Provenanced<number>;
+  views: MediaMetric;
+  reach: MediaMetric;
+  likes: MediaMetric;
+  comments: MediaMetric;
+  shares: MediaMetric;
+  saves: MediaMetric;
+  avgWatch: MediaMetric;
+  totalWatch: MediaMetric;
+  follows: MediaMetric;
   followsPer1k: Provenanced<number>;
   conversionPct: Provenanced<number>;
 }
 
 const MISSING = (name: string) => notAvailable("pending", `${name} has not been fetched`);
 
-function pick(m: MediaWithMetrics, ...names: string[]): Provenanced<number> {
-  const found = names.map((n) => m.metrics[n]).filter((x): x is Provenanced<number> => x !== undefined);
+function pick(m: MediaWithMetrics, ...names: string[]): MediaMetric {
+  const found = names.map((n) => m.metrics[n]).filter((x): x is MediaMetric => x !== undefined);
   return found.find(isAvailable) ?? found[0] ?? MISSING(names[0] ?? "metric");
 }
 

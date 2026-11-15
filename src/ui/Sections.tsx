@@ -2,10 +2,19 @@ import Link from "next/link";
 import { isAvailable, formatSigned } from "../lib/provenance";
 import type { DashboardData } from "../lib/queries/ui/dashboard";
 import { HISTORY_DAYS } from "../lib/queries/ui/dashboard";
-import type { GrowthPeriod } from "../lib/queries";
+import type { GrowthPeriod, MediaMetric } from "../lib/queries";
 import { averageDailyNet, paceGap, progressPct } from "./derive";
 import { FollowerChart, NewFollowersChart } from "./Charts";
-import { formatDateTime, formatDate, formatDurationMs, formatLocalDateShort, formatInt } from "./format";
+import {
+  formatAgeHours,
+  formatDateTime,
+  formatDate,
+  formatDurationMs,
+  formatLocalDateShort,
+  formatInt,
+  lastRecordedText,
+  localizeIsoTimestamps,
+} from "./format";
 import { Metric, Provenance } from "./Metric";
 import { buildPostView, nextSort, sortParam, sortPosts, type PostView, type SortKey, type SortSpec } from "./posts";
 
@@ -48,24 +57,33 @@ export function Header({ data, tz }: P) {
           Last successful sync:{" "}
           <Metric p={lastSync} tz={tz} format={(s) => formatDateTime(s.finishedAt ?? s.startedAt, tz)} />
         </p>
+        <form method="post" action="/api/auth/logout" className="logout">
+          <button type="submit" className="btn btn-quiet">Log out</button>
+        </form>
       </div>
       {errorCount > 0 && (
         <details className="errors">
           <summary>
             {errorCount} recent sync or API {errorCount === 1 ? "problem" : "problems"}
           </summary>
-          <ul>
+          <ul className="error-list">
             {errs.failedRuns.map((r) => (
               <li key={`run-${r.id}`}>
-                <strong>{r.kind} sync {r.status}</strong> at {formatDateTime(r.startedAt, tz)}
-                {r.errorCode ? ` (${r.errorCode})` : ""}
-                {r.errorMessage ? `: ${r.errorMessage}` : ""}
+                <time dateTime={r.startedAt.toISOString()}>{formatDateTime(r.startedAt, tz)}</time>
+                <span className="err-job">{r.kind} sync ({r.status})</span>
+                <span className="err-msg">
+                  {[r.errorCode, r.errorMessage].filter(Boolean).join(": ") || "No error message was recorded"}
+                </span>
               </li>
             ))}
             {errs.apiErrors.map((e) => (
               <li key={`err-${e.id}`}>
-                <strong>{e.classification}</strong> on {e.endpoint}
-                {e.metric ? ` (${e.metric})` : ""} at {formatDateTime(e.occurredAt, tz)}: {e.message}
+                <time dateTime={e.occurredAt.toISOString()}>{formatDateTime(e.occurredAt, tz)}</time>
+                <span className="err-job">
+                  {e.endpoint}
+                  {e.metric ? ` (${e.metric})` : ""} ({e.classification})
+                </span>
+                <span className="err-msg">{e.message || "No error message was recorded"}</span>
               </li>
             ))}
           </ul>
@@ -104,6 +122,19 @@ export function Hero({ data, tz }: P) {
         <Metric p={current} tz={tz} />
         <Provenance p={current} tz={tz} />
       </p>
+      {isAvailable(current) && (
+        <p className="as-of small">
+          <span>
+            as of <time dateTime={current.retrievedAt.toISOString()}>{formatDateTime(current.retrievedAt, tz)}</time>
+            {current.snapshotAgeHours !== undefined && <> ({formatAgeHours(current.snapshotAgeHours)})</>}
+          </span>
+          {current.stale && (
+            <span className="pill pill-warn chip" role="status">
+              Stale: last sync is over 8 hours old
+            </span>
+          )}
+        </p>
+      )}
       <div
         className="progress"
         role="progressbar"
@@ -154,6 +185,12 @@ export function Hero({ data, tz }: P) {
 
 const PERIOD_LABEL: Record<GrowthPeriod, string> = { day: "Today", week: "This week", month: "This month" };
 
+/** A not-available reason with ISO timestamps shown in the reporting timezone; the original stays in title. */
+function Reason({ text, tz }: { text: string; tz: string }) {
+  const friendly = localizeIsoTimestamps(text, tz);
+  return <span title={text}>{friendly}</span>;
+}
+
 export function Growth({ data, tz }: P) {
   const periods: GrowthPeriod[] = ["day", "week", "month"];
   const required = isAvailable(data.pace)
@@ -163,6 +200,23 @@ export function Growth({ data, tz }: P) {
     <section aria-labelledby="growth-h">
       <h2 id="growth-h">Net follower growth</h2>
       <div className="cards">
+        <article className="card">
+          <h3 className="label">Yesterday ({formatLocalDateShort(data.yesterdayDate)})</h3>
+          <p className="card-number">
+            <Metric p={data.yesterday} tz={tz} format={(v) => formatSigned(v.delta)} />
+            <Provenance p={data.yesterday} tz={tz} />
+          </p>
+          <p className="small">
+            {isAvailable(data.yesterday) ? (
+              <>
+                From the snapshot at <time dateTime={data.yesterday.value.start.retrievedAt.toISOString()}>{formatDateTime(data.yesterday.value.start.retrievedAt, tz)}</time>{" "}
+                to the snapshot at <time dateTime={data.yesterday.value.end.retrievedAt.toISOString()}>{formatDateTime(data.yesterday.value.end.retrievedAt, tz)}</time>
+              </>
+            ) : (
+              <Reason text={data.yesterday.reason} tz={tz} />
+            )}
+          </p>
+        </article>
         {periods.map((k) => {
           const g = data.growth[k];
           return (
@@ -179,7 +233,7 @@ export function Growth({ data, tz }: P) {
                     and <time dateTime={g.value.end.retrievedAt.toISOString()}>{formatDateTime(g.value.end.retrievedAt, tz)}</time>
                   </>
                 ) : (
-                  g.reason
+                  <Reason text={g.reason} tz={tz} />
                 )}
               </p>
             </article>
@@ -193,7 +247,7 @@ export function Growth({ data, tz }: P) {
           Actual is the average net change per day between the two snapshots shown above. Required is what the
           remaining days need from today.
         </p>
-        <div className="table-wrap">
+        <div className="table-wrap stack">
           <table>
             <thead>
               <tr>
@@ -210,11 +264,13 @@ export function Growth({ data, tz }: P) {
                 return (
                   <tr key={k}>
                     <th scope="row">{PERIOD_LABEL[k]}</th>
-                    <td className="num"><Metric p={actual} tz={tz} format={(v) => signed2.format(v)} /></td>
-                    <td className="num"><Metric p={required} tz={tz} format={(v) => dec2.format(v)} /></td>
-                    <td className="num">
-                      <Metric p={gap} tz={tz} format={(v) => signed2.format(v)} />
-                      {isAvailable(gap) && <span className="small"> {gap.value >= 0 ? "ahead" : "behind"}</span>}
+                    <td className="num" data-label="Actual per day"><Metric p={actual} tz={tz} format={(v) => signed2.format(v)} /></td>
+                    <td className="num" data-label="Required per day"><Metric p={required} tz={tz} format={(v) => dec2.format(v)} /></td>
+                    <td className="num" data-label="Difference">
+                      <span>
+                        <Metric p={gap} tz={tz} format={(v) => signed2.format(v)} />
+                        {isAvailable(gap) && <span className="small"> {gap.value >= 0 ? "ahead" : "behind"}</span>}
+                      </span>
                     </td>
                   </tr>
                 );
@@ -239,7 +295,7 @@ export function History({ data, tz }: P) {
         never filled or joined across.
       </p>
       <FollowerChart days={data.history} tz={tz} />
-      <div className="table-wrap scroll-y">
+      <div className="table-wrap scroll-y fit">
         <table>
           <thead>
             <tr>
@@ -277,9 +333,12 @@ export function NewFollowers({ data, tz }: P) {
       </p>
       <NewFollowersChart points={data.newFollowers} from={from} to={to} tz={tz} />
       {data.newFollowers.length > 0 && (
+        <p className="small">Bars rise from the chart baseline; the top label is the highest value reported in the period.</p>
+      )}
+      {data.newFollowers.length > 0 && (
         <details className="more">
           <summary>Show values as a table</summary>
-          <div className="table-wrap scroll-y">
+          <div className="table-wrap scroll-y fit">
             <table>
               <thead>
                 <tr>
@@ -304,6 +363,20 @@ export function NewFollowers({ data, tz }: P) {
 }
 
 /* ------------------------------------------------------------- Posts */
+
+/**
+ * A post metric: the main value is always the latest observation ("Unavailable" if it is not
+ * available). A secondary line shows the last real reading, if any; it is display-only.
+ */
+function PostMetric({ m, tz, format, note }: { m: MediaMetric; tz: string; format?: (v: number) => string; note?: string }) {
+  const last = lastRecordedText(m, tz, format);
+  return (
+    <>
+      <Metric p={m} tz={tz} format={format} note={note} />
+      {last && <span className="small block last-recorded">{last}</span>}
+    </>
+  );
+}
 
 const REELS_FOLLOWS_NOTE = "Instagram's API does not report follows for Reels";
 
@@ -399,21 +472,21 @@ export function Posts({ data, tz, spec }: P & { spec: SortSpec }) {
                       </span>
                     </span>
                   </th>
-                  <td className="num" data-label="Views"><Metric p={p.views} tz={tz} /></td>
+                  <td className="num" data-label="Views"><PostMetric m={p.views} tz={tz} /></td>
                   <td className="num" data-label="Reach">
-                    <Metric p={p.reach} tz={tz} />
+                    <PostMetric m={p.reach} tz={tz} />
                     {isAvailable(p.reach) && p.reach.isPlatformEstimated && (
                       <abbr className="est" title="Reach is estimated by Instagram">est.</abbr>
                     )}
                   </td>
-                  <td className="num" data-label="Likes"><Metric p={p.likes} tz={tz} /></td>
-                  <td className="num" data-label="Comments"><Metric p={p.comments} tz={tz} /></td>
-                  <td className="num" data-label="Shares"><Metric p={p.shares} tz={tz} /></td>
-                  <td className="num" data-label="Saves"><Metric p={p.saves} tz={tz} /></td>
-                  <td className="num" data-label="Avg watch time"><Metric p={p.avgWatch} tz={tz} format={dur} /></td>
-                  <td className="num" data-label="Total watch time"><Metric p={p.totalWatch} tz={tz} format={dur} /></td>
+                  <td className="num" data-label="Likes"><PostMetric m={p.likes} tz={tz} /></td>
+                  <td className="num" data-label="Comments"><PostMetric m={p.comments} tz={tz} /></td>
+                  <td className="num" data-label="Shares"><PostMetric m={p.shares} tz={tz} /></td>
+                  <td className="num" data-label="Saves"><PostMetric m={p.saves} tz={tz} /></td>
+                  <td className="num" data-label="Avg watch time"><PostMetric m={p.avgWatch} tz={tz} format={dur} /></td>
+                  <td className="num" data-label="Total watch time"><PostMetric m={p.totalWatch} tz={tz} format={dur} /></td>
                   <td className="num" data-label="Follows">
-                    <Metric p={p.follows} tz={tz} note={p.isReel ? REELS_FOLLOWS_NOTE : undefined} />
+                    <PostMetric m={p.follows} tz={tz} note={p.isReel ? REELS_FOLLOWS_NOTE : undefined} />
                   </td>
                   <td className="num" data-label="Follows per 1,000 views">
                     <Metric p={p.followsPer1k} tz={tz} format={(v) => dec2.format(v)} />

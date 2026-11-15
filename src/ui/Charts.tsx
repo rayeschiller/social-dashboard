@@ -107,7 +107,6 @@ export function NewFollowersChart({
         );
       })}
       <text className="tick" x={PAD.l - 8} y={PAD.t + 4} textAnchor="end">{fmt(max)}</text>
-      <text className="tick" x={PAD.l - 8} y={PAD.t + IH + 4} textAnchor="end">0</text>
       <text className="tick" x={PAD.l} y={H - 8}>{formatDateTime(from, tz).split(",").slice(0, 2).join(",")}</text>
       <text className="tick" x={W - PAD.r} y={H - 8} textAnchor="end">{formatDateTime(to, tz).split(",").slice(0, 2).join(",")}</text>
     </svg></div>

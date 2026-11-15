@@ -107,8 +107,22 @@ p { margin: 0 0 8px; }
 .banner h2 { margin-bottom: 4px; }
 .banner p { max-width: 62ch; margin-bottom: 10px; }
 
+.btn-quiet { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+.btn-quiet:hover { border-color: var(--ink-2); }
+.logout { margin: 0; }
+.error-list { list-style: none; padding-left: 0 !important; }
+.error-list li { display: grid; gap: 2px 12px; grid-template-columns: 1fr; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.error-list li:last-child { border-bottom: 0; padding-bottom: 0; }
+.error-list time { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.err-job { font-weight: 600; }
+.err-msg { overflow-wrap: anywhere; }
+@media (min-width: 640px) { .error-list li { grid-template-columns: 13rem 14rem 1fr; } }
+
 /* hero */
 .hero { background: var(--surface); border: 1px solid var(--line); border-radius: 20px; padding: 24px 20px; }
+.as-of { margin: -8px 0 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.chip { padding: 2px 10px; }
+.last-recorded { font-weight: 400; margin-top: 2px; white-space: normal; text-align: right; }
 .hero-number { font-size: clamp(2.5rem, 13vw, 5rem); font-weight: 700; line-height: 1.05; letter-spacing: -0.03em; margin: 0 0 16px; overflow-wrap: anywhere; }
 .hero-number .metric.is-unavailable { font-size: 0.5em; letter-spacing: 0; }
 .progress { height: 14px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
@@ -171,6 +185,21 @@ thead th.num { white-space: normal; min-width: 3.5rem; }
   .stats { grid-template-columns: repeat(3, 1fr); }
   .cards { grid-template-columns: repeat(3, 1fr); }
   .hero { padding: 32px; }
+}
+
+@media (min-width: 960px) { .cards { grid-template-columns: repeat(4, 1fr); } }
+
+/* small tables stack as labelled cards on phones so no column is clipped */
+@media (max-width: 639px) {
+  .stack { border: 0; background: transparent; overflow: visible; }
+  .stack table, .stack tbody, .stack tr, .stack th, .stack td { display: block; min-width: 0; }
+  .stack thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  .stack tr { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 10px; padding: 10px 12px; }
+  .stack th[scope="row"] { border: 0; padding: 0 0 6px; font-weight: 650; }
+  .stack td { border: 0; padding: 4px 0; display: flex; justify-content: space-between; gap: 12px; white-space: normal; text-align: right; }
+  .stack td::before { content: attr(data-label); color: var(--ink-2); font-size: 0.75rem; text-align: left; }
+  .fit th, .fit td { padding: 8px; }
+  .fit td.small { white-space: normal; }
 }
 
 /* posts become stacked cards on narrow screens */

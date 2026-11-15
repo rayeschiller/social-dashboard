@@ -57,6 +57,36 @@ export function formatDurationMs(ms: number): string {
   return `${m} m ${String(s).padStart(2, "0")} s`;
 }
 
+const ISO_TIMESTAMP = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})/g;
+
+/**
+ * Rewrites every ISO-8601 timestamp that carries an explicit zone (Z or an offset) inside a
+ * free-text reason into the reporting timezone's readable form. Timestamps without a zone, or
+ * that are not real instants, are left exactly as they were. Pure; the caller keeps the original.
+ */
+export function localizeIsoTimestamps(text: string, tz: string): string {
+  return text.replace(ISO_TIMESTAMP, (m) => {
+    const d = new Date(m);
+    return Number.isNaN(d.getTime()) ? m : formatDateTime(d, tz);
+  });
+}
+
+/** Whole hours, rounded: "0 hours ago", "1 hour ago", "5 hours ago". */
+export function formatAgeHours(hours: number): string {
+  const n = Math.max(0, Math.round(hours));
+  return `${n} ${n === 1 ? "hour" : "hours"} ago`;
+}
+
+/** Secondary "last recorded <value> on <date>" line for a metric whose latest observation is not available. */
+export function lastRecordedText(
+  m: { status: string; lastAvailable?: { value: number; retrievedAt: Date } },
+  tz: string,
+  format: (n: number) => string = formatInt,
+): string | null {
+  if (m.status === "available" || !m.lastAvailable) return null;
+  return `last recorded ${format(m.lastAvailable.value)} on ${formatDate(m.lastAvailable.retrievedAt, tz)}`;
+}
+
 /** Human-readable provenance: source, retrieved-at and status/reason. Used for title attributes. */
 export function provenanceText(p: Provenanced<unknown>, tz: string, extraNote?: string): string {
   const parts: string[] = [];
@@ -67,7 +97,8 @@ export function provenanceText(p: Provenanced<unknown>, tz: string, extraNote?: 
     if (p.isPlatformEstimated) parts.push("Estimated by Instagram");
   } else {
     parts.push(`Status: ${p.status}`);
-    parts.push(`Reason: ${p.reason}`);
+    const friendly = localizeIsoTimestamps(p.reason, tz);
+    parts.push(friendly === p.reason ? `Reason: ${p.reason}` : `Reason: ${friendly} (original: ${p.reason})`);
     if (p.source) parts.push(`Source: ${sourceLabel(p.source)}`);
     if (p.retrievedAt) parts.push(`Last attempt: ${formatDateTime(p.retrievedAt, tz)}`);
   }
